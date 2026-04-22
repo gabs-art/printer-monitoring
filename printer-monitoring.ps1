@@ -105,8 +105,8 @@ function Wait-ServiceStatus {
     return (Get-Service -Name $Nome).Status -eq $Status
 }
 
-# Retorna jobs que devem ser cancelados:
-# job com status de erro OU impressora com problema, parado ha mais de $MinutosParaExpirar min
+# Retorna todos os jobs parados ha mais de $MinutosParaExpirar minutos.
+# Impressao deve acontecer na hora - qualquer job acima do limite esta travado.
 function Get-JobsExpirados {
     $limite    = (Get-Date).AddMinutes(-$MinutosParaExpirar)
     $resultado = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -121,39 +121,29 @@ function Get-JobsExpirados {
     Write-Log "Total de impressoras: $($impressoras.Count)"
 
     foreach ($impressora in $impressoras) {
-        $statusImpressora    = $impressora.PrinterStatus.ToString()
-        $impressoraComProb   = $statusImpressora -match "Offline|Error|PaperOut|UserIntervention|BlockedDeviceQueue"
-
-        if ($impressoraComProb) {
-            Write-Log "PROBLEMA: '$($impressora.Name)' | Status: $statusImpressora" "AVISO"
-        } else {
-            Write-Log "Verificando: '$($impressora.Name)' | Status: $statusImpressora"
-        }
+        $statusImpressora = $impressora.PrinterStatus.ToString()
+        Write-Log "Verificando: '$($impressora.Name)' | Status: $statusImpressora"
 
         $jobs = Get-PrintJob -PrinterName $impressora.Name -ErrorAction SilentlyContinue
         if (-not $jobs) { continue }
 
         foreach ($job in $jobs) {
-            $statusJob  = $job.JobStatus.ToString()
-            $jobComErro = $statusJob -match "Error|UserIntervention|Offline|PaperOut|BlockedDeviceQueue|Paused|Restart"
-
-            if (-not $jobComErro -and -not $impressoraComProb) { continue }
+            $idade = (Get-Date) - $job.SubmittedTime
 
             if ($job.SubmittedTime -ge $limite) {
-                $atual = Format-Idade -ts ((Get-Date) - $job.SubmittedTime)
-                Write-Log ("  Aguardando (prazo ok - {0}): ID={1} | '{2}'" -f $atual, $job.Id, $job.Document)
+                Write-Log ("  Recente ({0}): ID={1} | '{2}' | Status='{3}'" -f `
+                    (Format-Idade -ts $idade), $job.Id, $job.Document, $job.JobStatus)
                 continue
             }
 
-            $idade = Format-Idade -ts ((Get-Date) - $job.SubmittedTime)
             Write-Log ("  EXPIRADO [{0}]: ID={1} | Doc='{2}' | Usuario='{3}' | Status='{4}' | Fila='{5}'" -f `
-                $idade, $job.Id, $job.Document, $job.UserName, $statusJob, $impressora.Name) "AVISO"
+                (Format-Idade -ts $idade), $job.Id, $job.Document, $job.UserName, $job.JobStatus, $impressora.Name) "AVISO"
 
             $resultado.Add([PSCustomObject]@{
                 Id         = [int]$job.Id
                 Impressora = $impressora.Name
                 Documento  = $job.Document
-                Idade      = $idade
+                Idade      = Format-Idade -ts $idade
             })
         }
     }
