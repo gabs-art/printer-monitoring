@@ -2,22 +2,20 @@
 <#
 .SYNOPSIS
     Monitor de impressoras - varredura a cada 5 minutos.
-    Limpa apenas jobs com erro, preserva jobs aguardando impressao.
+    Remove jobs com erro ou em impressoras com problema que estejam parados ha mais de 30 minutos.
 .NOTES
-    Requer execucao como Administrador no servidor de impressao.
-    Para registrar como Tarefa Agendada, execute com o parametro -Registrar.
-    Exemplo: .\printers.ps1 -Registrar
+    Para registrar como Tarefa Agendada: .\printers.ps1 -Registrar
 #>
 
 param(
-    [switch]$Registrar
+    [switch]$Registrar,
+    [int]$MinutosParaExpirar = 30   # Jobs parados ha mais desse tempo serao removidos
 )
 
 # ─── Configuracoes ────────────────────────────────────────────────────────────
 $Config = @{
     LogDir          = "C:\Logs\PrinterMonitor"
     SpoolDir        = "$env:SystemRoot\System32\spool\PRINTERS"
-    IntervalSeconds = 300
     TaskName        = "PrinterMonitor"
     TaskDescription = "Monitor de filas de impressao - limpa erros e reinicia Spooler"
 }
@@ -51,94 +49,70 @@ function Remove-OldLogs {
         Remove-Item -Force -ErrorAction SilentlyContinue
 }
 
-function Get-JobsComErro {
-    param([string]$NomeImpressora)
-
-    $jobs = Get-PrintJob -PrinterName $NomeImpressora -ErrorAction SilentlyContinue
-    if (-not $jobs) { return @() }
-
-    return @($jobs | Where-Object {
-        $_.JobStatus -match "Error|UserIntervention|Offline|PaperOut|BlockedDeviceQueue|Paused|Restart"
-    })
+function Format-Idade {
+    param([TimeSpan]$ts)
+    if ($ts.TotalDays -ge 1) { return "$([int]$ts.TotalDays)d $($ts.Hours)h $($ts.Minutes)min" }
+    if ($ts.TotalHours -ge 1) { return "$([int]$ts.TotalHours)h $($ts.Minutes)min" }
+    return "$([int]$ts.TotalMinutes)min"
 }
 
-function Test-JobAindaExiste {
-    param([string]$NomeImpressora, [int]$JobId)
-
-    $jobs = Get-PrintJob -PrinterName $NomeImpressora -ErrorAction SilentlyContinue
-    return $null -ne ($jobs | Where-Object { $_.Id -eq $JobId })
-}
-
-# Tenta remover jobs com erro via cmdlet.
-# Retorna os IDs dos jobs que continuaram travados apos a tentativa.
-function Clear-FilaComErro {
-    param([string]$NomeImpressora)
-
-    $jobsErro = Get-JobsComErro -NomeImpressora $NomeImpressora
-    if ($jobsErro.Count -eq 0) { return @() }
-
-    Write-Log "  $($jobsErro.Count) job(s) com erro detectado(s) em '$NomeImpressora'" "AVISO"
-
-    $idsTravados = [System.Collections.Generic.List[int]]::new()
-
-    foreach ($job in $jobsErro) {
-        Write-Log ("  Tentando remover: ID={0} | Doc='{1}' | Usuario='{2}' | Status='{3}'" -f `
-            $job.Id, $job.Document, $job.UserName, $job.JobStatus) "AVISO"
-
-        Remove-PrintJob -PrinterName $NomeImpressora -Id $job.Id -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 800
-
-        if (Test-JobAindaExiste -NomeImpressora $NomeImpressora -JobId $job.Id) {
-            Write-Log "  Job ID=$($job.Id) continua travado no spool. Sera removido forcadamente." "AVISO"
-            $idsTravados.Add($job.Id)
-        } else {
-            Write-Log "  Job ID=$($job.Id) removido com sucesso."
-        }
-    }
-
-    return $idsTravados.ToArray()
-}
-
-function Invoke-VarredurasImpressoras {
-    Write-Log "════════════════════════════════════════"
-    Write-Log "Iniciando varredura de impressoras..."
+# Retorna lista de jobs que devem ser removidos:
+# - Job com status de erro E parado ha mais de $MinutosParaExpirar minutos
+# - OU impressora Offline/Erro E job parado ha mais de $MinutosParaExpirar minutos
+function Get-JobsParaRemover {
+    $limite     = (Get-Date).AddMinutes(-$MinutosParaExpirar)
+    $resultado  = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     try {
         $impressoras = Get-Printer -ErrorAction Stop
     } catch {
         Write-Log "Nao foi possivel listar impressoras: $($_.Exception.Message)" "ERRO"
-        return @()
+        return $resultado
     }
 
-    Write-Log "Total de impressoras: $($impressoras.Count)"
-
-    $todosIdsTravados = [System.Collections.Generic.List[int]]::new()
-    $totalOffline     = 0
-    $totalSemErro     = 0
+    Write-Log "Total de impressoras encontradas: $($impressoras.Count)"
 
     foreach ($impressora in $impressoras) {
-        $status = $impressora.PrinterStatus.ToString()
+        $statusImpressora = $impressora.PrinterStatus.ToString()
+        $impressoraComProblema = $statusImpressora -match "Offline|Error|PaperOut|UserIntervention|BlockedDeviceQueue"
 
-        if ($status -eq "Offline") {
-            $totalOffline++
-            Write-Log "OFFLINE: '$($impressora.Name)'" "AVISO"
+        if ($impressoraComProblema) {
+            Write-Log "PROBLEMA: '$($impressora.Name)' | Status: $statusImpressora" "AVISO"
         } else {
-            Write-Log "Verificando: '$($impressora.Name)' | Status: $status"
+            Write-Log "Verificando: '$($impressora.Name)' | Status: $statusImpressora"
         }
 
-        $idsTravados = Clear-FilaComErro -NomeImpressora $impressora.Name
+        $jobs = Get-PrintJob -PrinterName $impressora.Name -ErrorAction SilentlyContinue
+        if (-not $jobs) { continue }
 
-        if ($idsTravados.Count -eq 0) {
-            $totalSemErro++
-        } else {
-            foreach ($id in $idsTravados) { $todosIdsTravados.Add($id) }
+        foreach ($job in $jobs) {
+            $statusJob  = $job.JobStatus.ToString()
+            $jobComErro = $statusJob -match "Error|UserIntervention|Offline|PaperOut|BlockedDeviceQueue|Paused|Restart"
+
+            # Ignora jobs que estao ativamente imprimindo e saudaveis
+            if (-not $jobComErro -and -not $impressoraComProblema) { continue }
+
+            # Verifica se esta parado ha mais do tempo limite
+            if ($job.SubmittedTime -ge $limite) {
+                $idadeAtual = Format-Idade -ts ((Get-Date) - $job.SubmittedTime)
+                Write-Log ("  Aguardando (ainda no prazo - $idadeAtual): ID={0} | '{1}'" -f $job.Id, $job.Document)
+                continue
+            }
+
+            $idade = Format-Idade -ts ((Get-Date) - $job.SubmittedTime)
+            Write-Log ("  EXPIRADO [{5}]: ID={0} | Doc='{1}' | Usuario='{2}' | JobStatus='{3}' | Fila='{4}'" -f `
+                $job.Id, $job.Document, $job.UserName, $statusJob, $impressora.Name, $idade) "AVISO"
+
+            $resultado.Add([PSCustomObject]@{
+                Id         = $job.Id
+                Impressora = $impressora.Name
+                Documento  = $job.Document
+                Idade      = $idade
+            })
         }
     }
 
-    Write-Log ("Varredura concluida. OK: {0} | Offline: {1} | Jobs travados (forcado): {2}" -f `
-        $totalSemErro, $totalOffline, $todosIdsTravados.Count)
-
-    return $todosIdsTravados.ToArray()
+    return $resultado
 }
 
 function Wait-ServiceStatus {
@@ -151,29 +125,9 @@ function Wait-ServiceStatus {
     return (Get-Service -Name $Nome).Status -eq $Status
 }
 
-# Remove apenas os arquivos .SPL e .SHD dos job IDs informados.
-# Jobs saudaveis (aguardando impressao) nao sao tocados.
-function Remove-SpoolFilesPorId {
-    param([int[]]$JobIds)
-
-    foreach ($id in $JobIds) {
-        $baseName = "{0:D8}" -f $id
-        foreach ($ext in @("SPL", "SHD")) {
-            $arquivo = Join-Path $Config.SpoolDir "$baseName.$ext"
-            if (Test-Path $arquivo) {
-                Remove-Item -Path $arquivo -Force -ErrorAction SilentlyContinue
-                if (Test-Path $arquivo) {
-                    Write-Log "  Nao foi possivel excluir: $baseName.$ext" "ERRO"
-                } else {
-                    Write-Log "  Arquivo de spool excluido: $baseName.$ext"
-                }
-            }
-        }
-    }
-}
-
-function Restart-PrintSpooler {
-    param([int[]]$JobsTravados = @())
+# Para o Spooler, remove os arquivos .SPL/.SHD de cada job informado e sobe o servico novamente.
+function Invoke-LimpezaERestart {
+    param([System.Collections.Generic.List[PSCustomObject]]$Jobs)
 
     Write-Log "Parando servico Spooler..."
     try {
@@ -183,12 +137,35 @@ function Restart-PrintSpooler {
             Write-Log "Spooler nao parou dentro do tempo esperado." "ERRO"
             return
         }
+        Write-Log "Spooler parado."
 
-        if ($JobsTravados.Count -gt 0) {
-            Write-Log "Removendo arquivos de spool apenas dos $($JobsTravados.Count) job(s) travado(s)..." "AVISO"
-            Remove-SpoolFilesPorId -JobIds $JobsTravados
+        if ($Jobs.Count -gt 0) {
+            Write-Log "Removendo $($Jobs.Count) arquivo(s) de spool expirado(s)..." "AVISO"
+
+            foreach ($job in $Jobs) {
+                $baseName = "{0:D8}" -f [int]$job.Id
+                $removido = $false
+
+                foreach ($ext in @("SPL", "SHD")) {
+                    $arquivo = Join-Path $Config.SpoolDir "$baseName.$ext"
+                    if (Test-Path $arquivo) {
+                        Remove-Item -Path $arquivo -Force -ErrorAction SilentlyContinue
+                        if (-not (Test-Path $arquivo)) {
+                            Write-Log ("  OK: {0}.{1} | ID={2} | '{3}' | Fila='{4}'" -f `
+                                $baseName, $ext, $job.Id, $job.Documento, $job.Impressora)
+                            $removido = $true
+                        } else {
+                            Write-Log ("  FALHA ao excluir: {0}.{1}" -f $baseName, $ext) "ERRO"
+                        }
+                    }
+                }
+
+                if (-not $removido) {
+                    Write-Log ("  Arquivos nao encontrados no spool para ID={0} (ja removidos ou ID divergente)" -f $job.Id) "AVISO"
+                }
+            }
         } else {
-            Write-Log "Nenhum arquivo de spool para remover. Jobs aguardando impressao preservados."
+            Write-Log "Nenhum job expirado. Nenhum arquivo de spool removido."
         }
 
         Write-Log "Iniciando servico Spooler..."
@@ -200,7 +177,7 @@ function Restart-PrintSpooler {
             Write-Log "Spooler nao subiu dentro do tempo esperado." "AVISO"
         }
     } catch {
-        Write-Log "Falha ao reiniciar Spooler: $($_.Exception.Message)" "ERRO"
+        Write-Log "Erro critico no ciclo do Spooler: $($_.Exception.Message)" "ERRO"
         Start-Service -Name Spooler -ErrorAction SilentlyContinue
     }
 }
@@ -235,7 +212,7 @@ function Register-TarefaAgendada {
         -Force | Out-Null
 
     Write-Host "Tarefa '$($Config.TaskName)' registrada com sucesso!" -ForegroundColor Green
-    Write-Host "O script sera executado automaticamente a cada 5 minutos pelo Task Scheduler.`n" -ForegroundColor Green
+    Write-Host "Execucao automatica a cada 5 minutos via Task Scheduler.`n" -ForegroundColor Green
 }
 
 # ─── Entrypoint ───────────────────────────────────────────────────────────────
@@ -248,6 +225,13 @@ if ($Registrar) {
 }
 
 Remove-OldLogs
-$idsTravados = Invoke-VarredurasImpressoras
-Restart-PrintSpooler -JobsTravados $idsTravados
-Write-Log "Ciclo concluido. Proxima execucao em $($Config.IntervalSeconds / 60) minuto(s)."
+
+Write-Log "════════════════════════════════════════"
+Write-Log "Iniciando ciclo | Limite de expiracao: $MinutosParaExpirar minutos"
+
+$jobsParaRemover = Get-JobsParaRemover
+Write-Log "Jobs expirados encontrados: $($jobsParaRemover.Count)"
+
+Invoke-LimpezaERestart -Jobs $jobsParaRemover
+
+Write-Log "Ciclo concluido."
