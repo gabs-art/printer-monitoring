@@ -1,15 +1,17 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Monitor de impressoras - varredura a cada 5 minutos.
-    Remove jobs com erro ou em impressoras com problema que estejam parados ha mais de 30 minutos.
+    Monitor de impressoras - replica exatamente o fluxo manual:
+    "Abrir fila > botao direito > Cancelar > Sim"
+    Remove jobs expirados (erro ou impressora offline) via API Win32,
+    com fallback de exclusao fisica dos arquivos .SPL/.SHD.
 .NOTES
     Para registrar como Tarefa Agendada: .\printers.ps1 -Registrar
 #>
 
 param(
     [switch]$Registrar,
-    [int]$MinutosParaExpirar = 30   # Jobs parados ha mais desse tempo serao removidos
+    [int]$MinutosParaExpirar = 30
 )
 
 # ─── Configuracoes ────────────────────────────────────────────────────────────
@@ -17,7 +19,7 @@ $Config = @{
     LogDir          = "C:\Logs\PrinterMonitor"
     SpoolDir        = "$env:SystemRoot\System32\spool\PRINTERS"
     TaskName        = "PrinterMonitor"
-    TaskDescription = "Monitor de filas de impressao - limpa erros e reinicia Spooler"
+    TaskDescription = "Monitor de filas de impressao - cancela jobs expirados e reinicia Spooler"
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -51,68 +53,46 @@ function Remove-OldLogs {
 
 function Format-Idade {
     param([TimeSpan]$ts)
-    if ($ts.TotalDays -ge 1) { return "$([int]$ts.TotalDays)d $($ts.Hours)h $($ts.Minutes)min" }
-    if ($ts.TotalHours -ge 1) { return "$([int]$ts.TotalHours)h $($ts.Minutes)min" }
+    if ($ts.TotalDays -ge 1)   { return "$([int]$ts.TotalDays)d $($ts.Hours)h $($ts.Minutes)min" }
+    if ($ts.TotalHours -ge 1)  { return "$([int]$ts.TotalHours)h $($ts.Minutes)min" }
     return "$([int]$ts.TotalMinutes)min"
 }
 
-# Retorna lista de jobs que devem ser removidos:
-# - Job com status de erro E parado ha mais de $MinutosParaExpirar minutos
-# - OU impressora Offline/Erro E job parado ha mais de $MinutosParaExpirar minutos
-function Get-JobsParaRemover {
-    $limite     = (Get-Date).AddMinutes(-$MinutosParaExpirar)
-    $resultado  = [System.Collections.Generic.List[PSCustomObject]]::new()
+# ─── API Win32 - mesmo caminho que o botao "Cancelar" da UI usa ───────────────
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class WinPrint {
+    [DllImport("winspool.drv", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern bool OpenPrinter(string pPrinterName, out IntPtr phPrinter, IntPtr pDefault);
 
+    [DllImport("winspool.drv", SetLastError=true)]
+    public static extern bool SetJob(IntPtr hPrinter, int JobId, int Level, IntPtr pJob, int Command);
+
+    [DllImport("winspool.drv", SetLastError=true)]
+    public static extern bool ClosePrinter(IntPtr hPrinter);
+
+    public const int JOB_CONTROL_DELETE = 5;
+}
+"@
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Invoke-CancelarJobAPI {
+    param([string]$NomeImpressora, [int]$JobId)
+
+    $hPrinter = [IntPtr]::Zero
     try {
-        $impressoras = Get-Printer -ErrorAction Stop
+        if ([WinPrint]::OpenPrinter($NomeImpressora, [ref]$hPrinter, [IntPtr]::Zero)) {
+            $ok = [WinPrint]::SetJob($hPrinter, $JobId, 0, [IntPtr]::Zero, [WinPrint]::JOB_CONTROL_DELETE)
+            [WinPrint]::ClosePrinter($hPrinter) | Out-Null
+            return $ok
+        }
     } catch {
-        Write-Log "Nao foi possivel listar impressoras: $($_.Exception.Message)" "ERRO"
-        return $resultado
-    }
-
-    Write-Log "Total de impressoras encontradas: $($impressoras.Count)"
-
-    foreach ($impressora in $impressoras) {
-        $statusImpressora = $impressora.PrinterStatus.ToString()
-        $impressoraComProblema = $statusImpressora -match "Offline|Error|PaperOut|UserIntervention|BlockedDeviceQueue"
-
-        if ($impressoraComProblema) {
-            Write-Log "PROBLEMA: '$($impressora.Name)' | Status: $statusImpressora" "AVISO"
-        } else {
-            Write-Log "Verificando: '$($impressora.Name)' | Status: $statusImpressora"
-        }
-
-        $jobs = Get-PrintJob -PrinterName $impressora.Name -ErrorAction SilentlyContinue
-        if (-not $jobs) { continue }
-
-        foreach ($job in $jobs) {
-            $statusJob  = $job.JobStatus.ToString()
-            $jobComErro = $statusJob -match "Error|UserIntervention|Offline|PaperOut|BlockedDeviceQueue|Paused|Restart"
-
-            # Ignora jobs que estao ativamente imprimindo e saudaveis
-            if (-not $jobComErro -and -not $impressoraComProblema) { continue }
-
-            # Verifica se esta parado ha mais do tempo limite
-            if ($job.SubmittedTime -ge $limite) {
-                $idadeAtual = Format-Idade -ts ((Get-Date) - $job.SubmittedTime)
-                Write-Log ("  Aguardando (ainda no prazo - $idadeAtual): ID={0} | '{1}'" -f $job.Id, $job.Document)
-                continue
-            }
-
-            $idade = Format-Idade -ts ((Get-Date) - $job.SubmittedTime)
-            Write-Log ("  EXPIRADO [{5}]: ID={0} | Doc='{1}' | Usuario='{2}' | JobStatus='{3}' | Fila='{4}'" -f `
-                $job.Id, $job.Document, $job.UserName, $statusJob, $impressora.Name, $idade) "AVISO"
-
-            $resultado.Add([PSCustomObject]@{
-                Id         = $job.Id
-                Impressora = $impressora.Name
-                Documento  = $job.Document
-                Idade      = $idade
-            })
+        if ($hPrinter -ne [IntPtr]::Zero) {
+            [WinPrint]::ClosePrinter($hPrinter) | Out-Null
         }
     }
-
-    return $resultado
+    return $false
 }
 
 function Wait-ServiceStatus {
@@ -125,59 +105,164 @@ function Wait-ServiceStatus {
     return (Get-Service -Name $Nome).Status -eq $Status
 }
 
-# Para o Spooler, remove os arquivos .SPL/.SHD de cada job informado e sobe o servico novamente.
-function Invoke-LimpezaERestart {
+# Retorna jobs que devem ser cancelados:
+# job com status de erro OU impressora com problema, parado ha mais de $MinutosParaExpirar min
+function Get-JobsExpirados {
+    $limite    = (Get-Date).AddMinutes(-$MinutosParaExpirar)
+    $resultado = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    try {
+        $impressoras = Get-Printer -ErrorAction Stop
+    } catch {
+        Write-Log "Nao foi possivel listar impressoras: $($_.Exception.Message)" "ERRO"
+        return $resultado
+    }
+
+    Write-Log "Total de impressoras: $($impressoras.Count)"
+
+    foreach ($impressora in $impressoras) {
+        $statusImpressora    = $impressora.PrinterStatus.ToString()
+        $impressoraComProb   = $statusImpressora -match "Offline|Error|PaperOut|UserIntervention|BlockedDeviceQueue"
+
+        if ($impressoraComProb) {
+            Write-Log "PROBLEMA: '$($impressora.Name)' | Status: $statusImpressora" "AVISO"
+        } else {
+            Write-Log "Verificando: '$($impressora.Name)' | Status: $statusImpressora"
+        }
+
+        $jobs = Get-PrintJob -PrinterName $impressora.Name -ErrorAction SilentlyContinue
+        if (-not $jobs) { continue }
+
+        foreach ($job in $jobs) {
+            $statusJob  = $job.JobStatus.ToString()
+            $jobComErro = $statusJob -match "Error|UserIntervention|Offline|PaperOut|BlockedDeviceQueue|Paused|Restart"
+
+            if (-not $jobComErro -and -not $impressoraComProb) { continue }
+
+            if ($job.SubmittedTime -ge $limite) {
+                $atual = Format-Idade -ts ((Get-Date) - $job.SubmittedTime)
+                Write-Log ("  Aguardando (prazo ok - {0}): ID={1} | '{2}'" -f $atual, $job.Id, $job.Document)
+                continue
+            }
+
+            $idade = Format-Idade -ts ((Get-Date) - $job.SubmittedTime)
+            Write-Log ("  EXPIRADO [{0}]: ID={1} | Doc='{2}' | Usuario='{3}' | Status='{4}' | Fila='{5}'" -f `
+                $idade, $job.Id, $job.Document, $job.UserName, $statusJob, $impressora.Name) "AVISO"
+
+            $resultado.Add([PSCustomObject]@{
+                Id         = [int]$job.Id
+                Impressora = $impressora.Name
+                Documento  = $job.Document
+                Idade      = $idade
+            })
+        }
+    }
+
+    return $resultado
+}
+
+# Tenta cancelar cada job via API Win32 (mesmo caminho do botao "Cancelar" da UI).
+# Retorna lista dos que NAO foram removidos para tratamento forcado.
+function Invoke-CancelarJobs {
     param([System.Collections.Generic.List[PSCustomObject]]$Jobs)
 
-    Write-Log "Parando servico Spooler..."
+    $naoRemovidos = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    foreach ($job in $Jobs) {
+        Write-Log ("  Cancelando via API: ID={0} | '{1}' | Fila='{2}' | {3}" -f `
+            $job.Id, $job.Documento, $job.Impressora, $job.Idade) "AVISO"
+
+        $ok = Invoke-CancelarJobAPI -NomeImpressora $job.Impressora -JobId $job.Id
+
+        if ($ok) {
+            Write-Log "  OK: Job ID=$($job.Id) cancelado com sucesso."
+        } else {
+            Write-Log "  API falhou para Job ID=$($job.Id). Sera removido fisicamente." "AVISO"
+            $naoRemovidos.Add($job)
+        }
+    }
+
+    return $naoRemovidos
+}
+
+# Fallback: para o Spooler, localiza os arquivos .SHD/.SPL das impressoras
+# com jobs travados lendo o cabecalho binario do SHD, e os exclui.
+function Invoke-RemocaoFisica {
+    param([System.Collections.Generic.List[PSCustomObject]]$Jobs)
+
+    if ($Jobs.Count -eq 0) { return }
+
+    $impressorasAfetadas = @($Jobs | Select-Object -ExpandProperty Impressora -Unique)
+
+    Write-Log "Parando Spooler para remocao fisica de $($Jobs.Count) job(s) travado(s)..." "AVISO"
     try {
         Stop-Service -Name Spooler -Force -ErrorAction Stop
-
         if (-not (Wait-ServiceStatus -Nome Spooler -Status Stopped)) {
-            Write-Log "Spooler nao parou dentro do tempo esperado." "ERRO"
+            Write-Log "Spooler nao parou no tempo esperado." "ERRO"
             return
         }
         Write-Log "Spooler parado."
 
-        if ($Jobs.Count -gt 0) {
-            Write-Log "Removendo $($Jobs.Count) arquivo(s) de spool expirado(s)..." "AVISO"
+        $shdFiles = Get-ChildItem -Path $Config.SpoolDir -Filter "*.SHD" -ErrorAction SilentlyContinue
+        $removidos = 0
 
-            foreach ($job in $Jobs) {
-                $baseName = "{0:D8}" -f [int]$job.Id
-                $removido = $false
+        foreach ($shd in $shdFiles) {
+            try {
+                # Le o arquivo binario e converte para Unicode para encontrar o nome da impressora
+                $bytes   = [System.IO.File]::ReadAllBytes($shd.FullName)
+                $conteudo = [System.Text.Encoding]::Unicode.GetString($bytes)
 
-                foreach ($ext in @("SPL", "SHD")) {
-                    $arquivo = Join-Path $Config.SpoolDir "$baseName.$ext"
-                    if (Test-Path $arquivo) {
-                        Remove-Item -Path $arquivo -Force -ErrorAction SilentlyContinue
-                        if (-not (Test-Path $arquivo)) {
-                            Write-Log ("  OK: {0}.{1} | ID={2} | '{3}' | Fila='{4}'" -f `
-                                $baseName, $ext, $job.Id, $job.Documento, $job.Impressora)
-                            $removido = $true
-                        } else {
-                            Write-Log ("  FALHA ao excluir: {0}.{1}" -f $baseName, $ext) "ERRO"
+                foreach ($impressora in $impressorasAfetadas) {
+                    if ($conteudo -like "*$impressora*") {
+                        $spl = [System.IO.Path]::ChangeExtension($shd.FullName, ".SPL")
+
+                        Remove-Item -Path $shd.FullName -Force -ErrorAction SilentlyContinue
+                        if (Test-Path $spl) {
+                            Remove-Item -Path $spl -Force -ErrorAction SilentlyContinue
                         }
+
+                        Write-Log ("  Fisico removido: {0} | Impressora='{1}'" -f `
+                            [System.IO.Path]::GetFileNameWithoutExtension($shd.Name), $impressora)
+                        $removidos++
+                        break
                     }
                 }
-
-                if (-not $removido) {
-                    Write-Log ("  Arquivos nao encontrados no spool para ID={0} (ja removidos ou ID divergente)" -f $job.Id) "AVISO"
-                }
+            } catch {
+                # arquivo pode estar em uso por outro processo, ignora
             }
-        } else {
-            Write-Log "Nenhum job expirado. Nenhum arquivo de spool removido."
         }
 
-        Write-Log "Iniciando servico Spooler..."
-        Start-Service -Name Spooler -ErrorAction Stop
-
+        Write-Log "$removidos arquivo(s) de spool removido(s) fisicamente."
+    } catch {
+        Write-Log "Erro critico durante remocao fisica: $($_.Exception.Message)" "ERRO"
+    } finally {
+        Write-Log "Iniciando Spooler..."
+        Start-Service -Name Spooler -ErrorAction SilentlyContinue
         if (Wait-ServiceStatus -Nome Spooler -Status Running) {
             Write-Log "Spooler reiniciado com sucesso."
         } else {
-            Write-Log "Spooler nao subiu dentro do tempo esperado." "AVISO"
+            Write-Log "Spooler nao subiu no tempo esperado." "AVISO"
+        }
+    }
+}
+
+# Reinicio preventivo do Spooler quando nao ha jobs travados
+function Invoke-RestartSpooler {
+    Write-Log "Reiniciando Spooler preventivamente..."
+    try {
+        Stop-Service -Name Spooler -Force -ErrorAction Stop
+        if (Wait-ServiceStatus -Nome Spooler -Status Stopped) {
+            Start-Service -Name Spooler -ErrorAction Stop
+            if (Wait-ServiceStatus -Nome Spooler -Status Running) {
+                Write-Log "Spooler reiniciado com sucesso."
+            } else {
+                Write-Log "Spooler nao subiu no tempo esperado." "AVISO"
+            }
+        } else {
+            Write-Log "Spooler nao parou no tempo esperado." "ERRO"
         }
     } catch {
-        Write-Log "Erro critico no ciclo do Spooler: $($_.Exception.Message)" "ERRO"
+        Write-Log "Falha ao reiniciar Spooler: $($_.Exception.Message)" "ERRO"
         Start-Service -Name Spooler -ErrorAction SilentlyContinue
     }
 }
@@ -229,9 +314,18 @@ Remove-OldLogs
 Write-Log "════════════════════════════════════════"
 Write-Log "Iniciando ciclo | Limite de expiracao: $MinutosParaExpirar minutos"
 
-$jobsParaRemover = Get-JobsParaRemover
-Write-Log "Jobs expirados encontrados: $($jobsParaRemover.Count)"
+$jobsExpirados = Get-JobsExpirados
+Write-Log "Jobs expirados encontrados: $($jobsExpirados.Count)"
 
-Invoke-LimpezaERestart -Jobs $jobsParaRemover
+if ($jobsExpirados.Count -gt 0) {
+    # Passo 1: tenta cancelar via API Win32 (igual ao botao Cancelar da UI)
+    $jobsTravados = Invoke-CancelarJobs -Jobs $jobsExpirados
+
+    # Passo 2: para os que a API nao conseguiu, remove fisicamente os arquivos de spool
+    Invoke-RemocaoFisica -Jobs $jobsTravados
+} else {
+    # Sem jobs expirados: apenas reinicia o Spooler preventivamente
+    Invoke-RestartSpooler
+}
 
 Write-Log "Ciclo concluido."
