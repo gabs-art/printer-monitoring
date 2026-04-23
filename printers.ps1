@@ -121,7 +121,9 @@ function Wait-ServiceStatus {
 # Retorna todos os jobs parados ha mais de $MinutosParaExpirar minutos.
 # Impressao deve acontecer na hora - qualquer job acima do limite esta travado.
 function Get-JobsExpirados {
-    $limite    = (Get-Date).AddMinutes(-$MinutosParaExpirar)
+    # Usa UTC para ser imune a fuso horario e mudancas de horario de verao
+    $agora     = [DateTime]::UtcNow
+    $limite    = $agora.AddMinutes(-$MinutosParaExpirar)
     $resultado = [System.Collections.Generic.List[PSCustomObject]]::new()
 
     try {
@@ -157,24 +159,30 @@ function Get-JobsExpirados {
         foreach ($job in $jobs) {
             $statusJob = $job.JobStatus.ToString()
 
-            # Protege job ativamente imprimindo ou sendo recebido pelo servidor
-            if ($statusJob -match "Printing|IOActive|Spooling") {
+            # Protege job ativamente imprimindo SEM erro combinado
+            # "Error, Printing" = falhou durante impressao → nao e protegido
+            $jobAtivo   = $statusJob -match "Printing|IOActive|Spooling"
+            $jobComErro = $statusJob -match "Error|Offline|UserIntervention|PaperOut|BlockedDeviceQueue"
+
+            if ($jobAtivo -and -not $jobComErro) {
                 Write-Log ("  ATIVO (protegido): ID={0} | '{1}' | Usuario='{2}' | Status='{3}'" -f `
                     $job.Id, $job.Document, $job.UserName, $statusJob)
                 continue
             }
 
+            # Normaliza para UTC independente do fuso do servidor
+            $submittedUtc = $job.SubmittedTime.ToUniversalTime()
+
             # Protege jobs com data invalida (Windows pode retornar 0001-01-01)
-            # Esses registros corrompidos nao devem ser removidos automaticamente
-            if ($job.SubmittedTime.Year -lt 2000) {
+            if ($submittedUtc.Year -lt 2000) {
                 Write-Log ("  Data invalida (ignorado): ID={0} | '{1}' | SubmittedTime='{2}'" -f `
                     $job.Id, $job.Document, $job.SubmittedTime) "AVISO"
                 continue
             }
 
-            $idade = (Get-Date) - $job.SubmittedTime
+            $idade = $agora - $submittedUtc
 
-            if ($job.SubmittedTime -ge $limite) {
+            if ($submittedUtc -ge $limite) {
                 Write-Log ("  Recente ({0}): ID={1} | '{2}' | Status='{3}'" -f `
                     (Format-Idade -ts $idade), $job.Id, $job.Document, $statusJob)
                 continue
