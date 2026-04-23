@@ -11,7 +11,7 @@
 
 param(
     [switch]$Registrar,
-    [int]$MinutosParaExpirar = 30
+    [int]$MinutosParaExpirar = 1440   # 1440 min = 24h. Apenas jobs com mais de 1 dia serao removidos.
 )
 
 # ─── Configuracoes ────────────────────────────────────────────────────────────
@@ -78,12 +78,16 @@ public class WinPrint {
 # ─────────────────────────────────────────────────────────────────────────────
 
 function Invoke-CancelarJobAPI {
-    param([string]$NomeImpressora, [int]$JobId)
+    param(
+        [string]$NomeImpressora,
+        [int]$JobId,
+        [int]$Comando = 5   # 5 = JOB_CONTROL_DELETE | 3 = JOB_CONTROL_CANCEL
+    )
 
     $hPrinter = [IntPtr]::Zero
     try {
         if ([WinPrint]::OpenPrinter($NomeImpressora, [ref]$hPrinter, [IntPtr]::Zero)) {
-            $ok = [WinPrint]::SetJob($hPrinter, $JobId, 0, [IntPtr]::Zero, [WinPrint]::JOB_CONTROL_DELETE)
+            $ok = [WinPrint]::SetJob($hPrinter, $JobId, 0, [IntPtr]::Zero, $Comando)
             [WinPrint]::ClosePrinter($hPrinter) | Out-Null
             return $ok
         }
@@ -152,7 +156,8 @@ function Get-JobsExpirados {
 }
 
 # Tenta cancelar cada job via API Win32 (mesmo caminho do botao "Cancelar" da UI).
-# Retorna lista dos que NAO foram removidos para tratamento forcado.
+# Verifica se o job realmente saiu da fila apos a chamada.
+# Retorna lista dos que continuam na fila para tratamento forcado.
 function Invoke-CancelarJobs {
     param([System.Collections.Generic.List[PSCustomObject]]$Jobs)
 
@@ -162,12 +167,24 @@ function Invoke-CancelarJobs {
         Write-Log ("  Cancelando via API: ID={0} | '{1}' | Fila='{2}' | {3}" -f `
             $job.Id, $job.Documento, $job.Impressora, $job.Idade) "AVISO"
 
+        # Tenta DELETE; se falhar, tenta CANCEL antes de DELETE (necessario para status Complete)
         $ok = Invoke-CancelarJobAPI -NomeImpressora $job.Impressora -JobId $job.Id
+        if (-not $ok) {
+            # JOB_CONTROL_CANCEL = 3, depois DELETE = 5
+            Invoke-CancelarJobAPI -NomeImpressora $job.Impressora -JobId $job.Id -Comando 3 | Out-Null
+            Start-Sleep -Milliseconds 300
+            $ok = Invoke-CancelarJobAPI -NomeImpressora $job.Impressora -JobId $job.Id
+        }
 
-        if ($ok) {
-            Write-Log "  OK: Job ID=$($job.Id) cancelado com sucesso."
+        # Aguarda o Spooler processar e confirma se o job realmente saiu da fila
+        Start-Sleep -Milliseconds 800
+        $aindaExiste = Get-PrintJob -PrinterName $job.Impressora -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Id -eq $job.Id }
+
+        if (-not $aindaExiste) {
+            Write-Log "  OK: Job ID=$($job.Id) removido da fila com sucesso."
         } else {
-            Write-Log "  API falhou para Job ID=$($job.Id). Sera removido fisicamente." "AVISO"
+            Write-Log "  Job ID=$($job.Id) ainda na fila apos API. Encaminhando para remocao fisica." "AVISO"
             $naoRemovidos.Add($job)
         }
     }
@@ -302,7 +319,8 @@ if ($Registrar) {
 Remove-OldLogs
 
 Write-Log "════════════════════════════════════════"
-Write-Log "Iniciando ciclo | Limite de expiracao: $MinutosParaExpirar minutos"
+$limiteLabel = if ($MinutosParaExpirar -ge 1440) { "$([int]($MinutosParaExpirar/1440))d ($MinutosParaExpirar min)" } else { "$MinutosParaExpirar min" }
+Write-Log "Iniciando ciclo | Remove jobs parados ha mais de: $limiteLabel"
 
 $jobsExpirados = Get-JobsExpirados
 Write-Log "Jobs expirados encontrados: $($jobsExpirados.Count)"
