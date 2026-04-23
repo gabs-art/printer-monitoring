@@ -95,10 +95,19 @@ function Invoke-CancelarJobAPI {
 
     $hPrinter = [IntPtr]::Zero
     try {
-        if ([WinPrint]::OpenPrinter($NomeImpressora, [ref]$hPrinter, [IntPtr]::Zero)) {
+        $abriu = [WinPrint]::OpenPrinter($NomeImpressora, [ref]$hPrinter, [IntPtr]::Zero)
+        if ($abriu) {
             $ok = [WinPrint]::SetJob($hPrinter, $JobId, 0, [IntPtr]::Zero, $Comando)
+            if (-not $ok) {
+                $errCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                Write-Log ("  SetJob falhou: Win32Error={0} | Job={1} | Fila='{2}' | Cmd={3}" -f `
+                    $errCode, $JobId, $NomeImpressora, $Comando) "AVISO"
+            }
             [WinPrint]::ClosePrinter($hPrinter) | Out-Null
             return $ok
+        } else {
+            $errCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Write-Log ("  OpenPrinter falhou: Win32Error={0} | Fila='{1}'" -f $errCode, $NomeImpressora) "AVISO"
         }
     } catch {
         if ($hPrinter -ne [IntPtr]::Zero) {
@@ -313,8 +322,21 @@ function Invoke-RemocaoFisica {
                 }
 
                 if (-not $removeuEsteJob) {
-                    Write-Log ("  FALHA: nao foi possivel localizar arquivo de spool para Job={0} | Fila='{1}'" -f `
-                        $job.Id, $job.Impressora) "ERRO"
+                    # Metodo 3: job fantasma (ghost) - sem arquivo de spool.
+                    # Tenta limpar a entrada no registro que o Spooler le ao reiniciar.
+                    $regJob = "HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers\$($job.Impressora)\Jobs\$($job.Id)"
+                    if (Test-Path $regJob) {
+                        Remove-Item $regJob -Force -Recurse -ErrorAction SilentlyContinue
+                        Write-Log ("  Ghost removido (registro): Job={0} | Fila='{1}'" -f $job.Id, $job.Impressora)
+                        $removidos++
+                        $removeuEsteJob = $true
+                    }
+
+                    if (-not $removeuEsteJob) {
+                        $arquivosNoDir = (Get-ChildItem $Config.SpoolDir -ErrorAction SilentlyContinue).Name -join ', '
+                        Write-Log ("  FALHA: Job={0} | Fila='{1}' | Arquivos no spool dir: [{2}]" -f `
+                            $job.Id, $job.Impressora, $arquivosNoDir) "ERRO"
+                    }
                 }
             }
         }
