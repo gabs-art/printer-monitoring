@@ -11,7 +11,7 @@
 
 param(
     [switch]$Registrar,
-    [int]$MinutosParaExpirar = 30
+    [int]$MinutosParaExpirar = 20
 )
 
 # ─── Configuracoes ────────────────────────────────────────────────────────────
