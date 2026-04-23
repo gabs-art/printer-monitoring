@@ -254,50 +254,68 @@ function Invoke-CancelarJobs {
     return $naoRemovidos
 }
 
-# Fallback: para o Spooler, localiza os arquivos .SHD/.SPL das impressoras
-# com jobs travados lendo o cabecalho binario do SHD, e os exclui.
+# Fallback: para o Spooler e remove fisicamente os arquivos .SHD/.SPL dos jobs travados.
+# Tenta primeiro pelo ID do job (nome padrao do Windows: 00000175.SHD).
+# Se o arquivo nao existir com esse nome, faz scan binario dos SHDs procurando o nome da impressora.
 function Invoke-RemocaoFisica {
     param([object[]]$Jobs)
 
     if ($Jobs.Count -eq 0) { return }
 
-    $impressorasAfetadas = @($Jobs | Select-Object -ExpandProperty Impressora -Unique)
-
     Write-Log "Parando Spooler para remocao fisica de $($Jobs.Count) job(s) travado(s)..." "AVISO"
     try {
         Stop-Service -Name Spooler -Force -ErrorAction Stop
-        if (-not (Wait-ServiceStatus -Nome Spooler -Status Stopped)) {
+        if (-not (Wait-ServiceStatus -Nome Spooler -Status Stopped -TimeoutSeg 60)) {
             Write-Log "Spooler nao parou no tempo esperado." "ERRO"
             return
         }
         Write-Log "Spooler parado."
 
-        $shdFiles = Get-ChildItem -Path $Config.SpoolDir -Filter "*.SHD" -ErrorAction SilentlyContinue
         $removidos = 0
 
-        foreach ($shd in $shdFiles) {
-            try {
-                # Le o arquivo binario e converte para Unicode para encontrar o nome da impressora
-                $bytes   = [System.IO.File]::ReadAllBytes($shd.FullName)
-                $conteudo = [System.Text.Encoding]::Unicode.GetString($bytes)
+        foreach ($job in $Jobs) {
+            $removeuEsteJob = $false
 
-                foreach ($impressora in $impressorasAfetadas) {
-                    if ($conteudo -like "*$impressora*") {
-                        $spl = [System.IO.Path]::ChangeExtension($shd.FullName, ".SPL")
+            # Metodo 1: nome do arquivo = ID com 8 digitos (padrao Windows)
+            $shdDireto = Join-Path $Config.SpoolDir ("{0:D8}.SHD" -f $job.Id)
+            $splDireto = Join-Path $Config.SpoolDir ("{0:D8}.SPL" -f $job.Id)
 
-                        Remove-Item -Path $shd.FullName -Force -ErrorAction SilentlyContinue
-                        if (Test-Path $spl) {
-                            Remove-Item -Path $spl -Force -ErrorAction SilentlyContinue
+            if ((Test-Path $shdDireto) -or (Test-Path $splDireto)) {
+                if (Test-Path $shdDireto) { Remove-Item $shdDireto -Force -ErrorAction SilentlyContinue }
+                if (Test-Path $splDireto) { Remove-Item $splDireto -Force -ErrorAction SilentlyContinue }
+                Write-Log ("  Fisico removido (ID direto): Job={0} | Doc='{1}' | Fila='{2}'" -f `
+                    $job.Id, $job.Documento, $job.Impressora)
+                $removidos++
+                $removeuEsteJob = $true
+            }
+
+            if (-not $removeuEsteJob) {
+                # Metodo 2: scan de todos os SHDs - le binario e busca nome da impressora
+                Write-Log ("  {0:D8}.SHD nao encontrado. Fazendo scan por nome da impressora..." -f $job.Id) "AVISO"
+
+                $shdFiles = Get-ChildItem -Path $Config.SpoolDir -Filter "*.SHD" -ErrorAction SilentlyContinue
+                foreach ($shd in $shdFiles) {
+                    try {
+                        $bytes    = [System.IO.File]::ReadAllBytes($shd.FullName)
+                        $conteudo = [System.Text.Encoding]::Unicode.GetString($bytes)
+
+                        if ($conteudo -like "*$($job.Impressora)*") {
+                            $spl = [System.IO.Path]::ChangeExtension($shd.FullName, ".SPL")
+                            Remove-Item $shd.FullName -Force -ErrorAction SilentlyContinue
+                            if (Test-Path $spl) { Remove-Item $spl -Force -ErrorAction SilentlyContinue }
+                            Write-Log ("  Fisico removido (scan): {0} | Job={1} | Fila='{2}'" -f `
+                                $shd.BaseName, $job.Id, $job.Impressora)
+                            $removidos++
+                            $removeuEsteJob = $true
+                            break
                         }
-
-                        Write-Log ("  Fisico removido: {0} | Impressora='{1}'" -f `
-                            [System.IO.Path]::GetFileNameWithoutExtension($shd.Name), $impressora)
-                        $removidos++
-                        break
-                    }
+                    } catch { }
                 }
-            } catch {
-                # arquivo pode estar em uso por outro processo, ignora
+
+                if (-not $removeuEsteJob) {
+                    Write-Log ("  FALHA: nao foi possivel localizar arquivo de spool para Job={0} | Fila='{1}'" -f `
+                        $job.Id, $job.Impressora) "ERRO"
+                }
             }
         }
 
@@ -307,7 +325,7 @@ function Invoke-RemocaoFisica {
     } finally {
         Write-Log "Iniciando Spooler..."
         Start-Service -Name Spooler -ErrorAction SilentlyContinue
-        if (Wait-ServiceStatus -Nome Spooler -Status Running) {
+        if (Wait-ServiceStatus -Nome Spooler -Status Running -TimeoutSeg 60) {
             Write-Log "Spooler reiniciado com sucesso."
         } else {
             Write-Log "Spooler nao subiu no tempo esperado." "AVISO"
