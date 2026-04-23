@@ -159,9 +159,9 @@ function Get-JobsExpirados {
 # Verifica se o job realmente saiu da fila apos a chamada.
 # Retorna lista dos que continuam na fila para tratamento forcado.
 function Invoke-CancelarJobs {
-    param([System.Collections.Generic.List[PSCustomObject]]$Jobs)
+    param([object[]]$Jobs)
 
-    $naoRemovidos = [System.Collections.Generic.List[PSCustomObject]]::new()
+    $naoRemovidos = @()
 
     foreach ($job in $Jobs) {
         Write-Log ("  Cancelando via API: ID={0} | '{1}' | Fila='{2}' | {3}" -f `
@@ -185,7 +185,7 @@ function Invoke-CancelarJobs {
             Write-Log "  OK: Job ID=$($job.Id) removido da fila com sucesso."
         } else {
             Write-Log "  Job ID=$($job.Id) ainda na fila apos API. Encaminhando para remocao fisica." "AVISO"
-            $naoRemovidos.Add($job)
+            $naoRemovidos += $job
         }
     }
 
@@ -195,7 +195,7 @@ function Invoke-CancelarJobs {
 # Fallback: para o Spooler, localiza os arquivos .SHD/.SPL das impressoras
 # com jobs travados lendo o cabecalho binario do SHD, e os exclui.
 function Invoke-RemocaoFisica {
-    param([System.Collections.Generic.List[PSCustomObject]]$Jobs)
+    param([object[]]$Jobs)
 
     if ($Jobs.Count -eq 0) { return }
 
@@ -322,12 +322,13 @@ Write-Log "═══════════════════════
 $limiteLabel = if ($MinutosParaExpirar -ge 1440) { "$([int]($MinutosParaExpirar/1440))d ($MinutosParaExpirar min)" } else { "$MinutosParaExpirar min" }
 Write-Log "Iniciando ciclo | Remove jobs parados ha mais de: $limiteLabel"
 
-$jobsExpirados = Get-JobsExpirados
+# @() garante array mesmo quando a funcao retorna 1 unico item (PowerShell desempacota listas)
+$jobsExpirados = @(Get-JobsExpirados)
 Write-Log "Jobs expirados encontrados: $($jobsExpirados.Count)"
 
 if ($jobsExpirados.Count -gt 0) {
     # Passo 1: tenta cancelar via API Win32 (igual ao botao Cancelar da UI)
-    $jobsTravados = Invoke-CancelarJobs -Jobs $jobsExpirados
+    $jobsTravados = @(Invoke-CancelarJobs -Jobs $jobsExpirados)
 
     # Passo 2: para os que a API nao conseguiu, remove fisicamente os arquivos de spool
     Invoke-RemocaoFisica -Jobs $jobsTravados
