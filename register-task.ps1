@@ -15,6 +15,12 @@
 
     $TaskName = "PrinterMonitor"
 
+    # Remove a tarefa anterior se existir, evitando duplicatas
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Write-Host "Tarefa existente encontrada. Removendo antes de recriar..." -ForegroundColor DarkYellow
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    }
+
     $action = New-ScheduledTaskAction `
         -Execute "powershell.exe" `
         -Argument "-NonInteractive -NoProfile -ExecutionPolicy Bypass -File `"$ScriptPrinters`""
