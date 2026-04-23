@@ -157,13 +157,11 @@ function Get-JobsExpirados {
         if (-not $jobs) { continue }
 
         foreach ($job in $jobs) {
-            $statusJob = $job.JobStatus.ToString()
-
-            # Protege job ativamente imprimindo SEM erro combinado
-            # "Error, Printing" = falhou durante impressao → nao e protegido
+            $statusJob  = $job.JobStatus.ToString()
             $jobAtivo   = $statusJob -match "Printing|IOActive|Spooling"
             $jobComErro = $statusJob -match "Error|Offline|UserIntervention|PaperOut|BlockedDeviceQueue"
 
+            # Regra 1: job imprimindo ativamente SEM erro → protegido, nunca tocar
             if ($jobAtivo -and -not $jobComErro) {
                 Write-Log ("  ATIVO (protegido): ID={0} | '{1}' | Usuario='{2}' | Status='{3}'" -f `
                     $job.Id, $job.Document, $job.UserName, $statusJob)
@@ -173,7 +171,7 @@ function Get-JobsExpirados {
             # Normaliza para UTC independente do fuso do servidor
             $submittedUtc = $job.SubmittedTime.ToUniversalTime()
 
-            # Protege jobs com data invalida (Windows pode retornar 0001-01-01)
+            # Regra 2: data invalida (Windows pode retornar 0001-01-01) → ignorar
             if ($submittedUtc.Year -lt 2000) {
                 Write-Log ("  Data invalida (ignorado): ID={0} | '{1}' | SubmittedTime='{2}'" -f `
                     $job.Id, $job.Document, $job.SubmittedTime) "AVISO"
@@ -182,21 +180,37 @@ function Get-JobsExpirados {
 
             $idade = $agora - $submittedUtc
 
-            if ($submittedUtc -ge $limite) {
-                Write-Log ("  Recente ({0}): ID={1} | '{2}' | Status='{3}'" -f `
-                    (Format-Idade -ts $idade), $job.Id, $job.Document, $statusJob)
+            # Regra 3: job com status de erro → excluir independente da idade
+            if ($jobComErro) {
+                Write-Log ("  ERRO [{0}]: ID={1} | Doc='{2}' | Usuario='{3}' | Status='{4}' | Fila='{5}'" -f `
+                    (Format-Idade -ts $idade), $job.Id, $job.Document, $job.UserName, $statusJob, $impressora.Name) "AVISO"
+
+                $resultado.Add([PSCustomObject]@{
+                    Id         = [int]$job.Id
+                    Impressora = $impressora.Name
+                    Documento  = $job.Document
+                    Idade      = Format-Idade -ts $idade
+                })
                 continue
             }
 
-            Write-Log ("  EXPIRADO [{0}]: ID={1} | Doc='{2}' | Usuario='{3}' | Status='{4}' | Fila='{5}'" -f `
-                (Format-Idade -ts $idade), $job.Id, $job.Document, $job.UserName, $statusJob, $impressora.Name) "AVISO"
+            # Regra 4: sem erro mas parado ha mais de 1 dia → excluir
+            if ($submittedUtc -lt $limite) {
+                Write-Log ("  EXPIRADO [{0}]: ID={1} | Doc='{2}' | Usuario='{3}' | Status='{4}' | Fila='{5}'" -f `
+                    (Format-Idade -ts $idade), $job.Id, $job.Document, $job.UserName, $statusJob, $impressora.Name) "AVISO"
 
-            $resultado.Add([PSCustomObject]@{
-                Id         = [int]$job.Id
-                Impressora = $impressora.Name
-                Documento  = $job.Document
-                Idade      = Format-Idade -ts $idade
-            })
+                $resultado.Add([PSCustomObject]@{
+                    Id         = [int]$job.Id
+                    Impressora = $impressora.Name
+                    Documento  = $job.Document
+                    Idade      = Format-Idade -ts $idade
+                })
+                continue
+            }
+
+            # Job recente sem erro → manter
+            Write-Log ("  Recente ({0}): ID={1} | '{2}' | Status='{3}'" -f `
+                (Format-Idade -ts $idade), $job.Id, $job.Document, $statusJob)
         }
     }
 
