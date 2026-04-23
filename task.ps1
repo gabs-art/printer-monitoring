@@ -63,3 +63,17 @@ Write-Host "   Instalacao concluida!" -ForegroundColor Green
 Write-Host "   Arquivos em: $destRoot" -ForegroundColor White
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host ""
+
+# ── 3. Executar register-task.ps1 para registrar a tarefa agendada ──
+$registerScript = Join-Path $destRoot "register-task.ps1"
+
+Write-Host "[3/3] Registrando tarefa agendada..." -ForegroundColor Yellow
+try {
+    & powershell.exe -NonInteractive -NoProfile -ExecutionPolicy Bypass -File $registerScript
+    if ($LASTEXITCODE -ne 0) {
+        throw "register-task.ps1 encerrou com codigo $LASTEXITCODE"
+    }
+} catch {
+    Write-Host "ERRO ao registrar a tarefa: $_" -ForegroundColor Red
+    exit 1
+}
