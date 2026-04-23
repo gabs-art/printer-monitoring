@@ -20,6 +20,15 @@ $Config = @{
     SpoolDir        = "$env:SystemRoot\System32\spool\PRINTERS"
     TaskName        = "PrinterMonitor"
     TaskDescription = "Monitor de filas de impressao - cancela jobs expirados e reinicia Spooler"
+
+    # Impressoras virtuais/software: nao sao fisicas, seus jobs nunca chegam a imprimir
+    ImpressorasVirtuais = @(
+        "Microsoft Print to PDF",
+        "Microsoft XPS Document Writer",
+        "Fax",
+        "OneNote*",
+        "Send to OneNote*"
+    )
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -126,22 +135,53 @@ function Get-JobsExpirados {
 
     foreach ($impressora in $impressoras) {
         $statusImpressora = $impressora.PrinterStatus.ToString()
+
+        # Pula impressoras virtuais/software - nao sao fisicas
+        $eVirtual = $Config.ImpressorasVirtuais | Where-Object { $impressora.Name -like $_ }
+        if ($eVirtual) {
+            Write-Log "Virtual (ignorada): '$($impressora.Name)'"
+            continue
+        }
+
+        # Pula impressoras pausadas pelo admin - estado intencional, nao interferir
+        if ($statusImpressora -eq "Paused") {
+            Write-Log "Pausada pelo admin (ignorada): '$($impressora.Name)'" "AVISO"
+            continue
+        }
+
         Write-Log "Verificando: '$($impressora.Name)' | Status: $statusImpressora"
 
         $jobs = Get-PrintJob -PrinterName $impressora.Name -ErrorAction SilentlyContinue
         if (-not $jobs) { continue }
 
         foreach ($job in $jobs) {
+            $statusJob = $job.JobStatus.ToString()
+
+            # Protege job ativamente imprimindo ou sendo recebido pelo servidor
+            if ($statusJob -match "Printing|IOActive|Spooling") {
+                Write-Log ("  ATIVO (protegido): ID={0} | '{1}' | Usuario='{2}' | Status='{3}'" -f `
+                    $job.Id, $job.Document, $job.UserName, $statusJob)
+                continue
+            }
+
+            # Protege jobs com data invalida (Windows pode retornar 0001-01-01)
+            # Esses registros corrompidos nao devem ser removidos automaticamente
+            if ($job.SubmittedTime.Year -lt 2000) {
+                Write-Log ("  Data invalida (ignorado): ID={0} | '{1}' | SubmittedTime='{2}'" -f `
+                    $job.Id, $job.Document, $job.SubmittedTime) "AVISO"
+                continue
+            }
+
             $idade = (Get-Date) - $job.SubmittedTime
 
             if ($job.SubmittedTime -ge $limite) {
                 Write-Log ("  Recente ({0}): ID={1} | '{2}' | Status='{3}'" -f `
-                    (Format-Idade -ts $idade), $job.Id, $job.Document, $job.JobStatus)
+                    (Format-Idade -ts $idade), $job.Id, $job.Document, $statusJob)
                 continue
             }
 
             Write-Log ("  EXPIRADO [{0}]: ID={1} | Doc='{2}' | Usuario='{3}' | Status='{4}' | Fila='{5}'" -f `
-                (Format-Idade -ts $idade), $job.Id, $job.Document, $job.UserName, $job.JobStatus, $impressora.Name) "AVISO"
+                (Format-Idade -ts $idade), $job.Id, $job.Document, $job.UserName, $statusJob, $impressora.Name) "AVISO"
 
             $resultado.Add([PSCustomObject]@{
                 Id         = [int]$job.Id
@@ -253,26 +293,6 @@ function Invoke-RemocaoFisica {
     }
 }
 
-# Reinicio preventivo do Spooler quando nao ha jobs travados
-function Invoke-RestartSpooler {
-    Write-Log "Reiniciando Spooler preventivamente..."
-    try {
-        Stop-Service -Name Spooler -Force -ErrorAction Stop
-        if (Wait-ServiceStatus -Nome Spooler -Status Stopped) {
-            Start-Service -Name Spooler -ErrorAction Stop
-            if (Wait-ServiceStatus -Nome Spooler -Status Running) {
-                Write-Log "Spooler reiniciado com sucesso."
-            } else {
-                Write-Log "Spooler nao subiu no tempo esperado." "AVISO"
-            }
-        } else {
-            Write-Log "Spooler nao parou no tempo esperado." "ERRO"
-        }
-    } catch {
-        Write-Log "Falha ao reiniciar Spooler: $($_.Exception.Message)" "ERRO"
-        Start-Service -Name Spooler -ErrorAction SilentlyContinue
-    }
-}
 
 function Register-TarefaAgendada {
     Write-Host "`nRegistrando Tarefa Agendada '$($Config.TaskName)'..." -ForegroundColor Green
