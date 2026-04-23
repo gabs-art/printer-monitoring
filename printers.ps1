@@ -285,17 +285,26 @@ function Invoke-RemocaoFisica {
         foreach ($job in $Jobs) {
             $removeuEsteJob = $false
 
-            # Metodo 1: nome do arquivo = ID com 8 digitos (padrao Windows)
-            $shdDireto = Join-Path $Config.SpoolDir ("{0:D8}.SHD" -f $job.Id)
-            $splDireto = Join-Path $Config.SpoolDir ("{0:D8}.SPL" -f $job.Id)
+            # Metodo 1: tenta os dois padroes de nome que o Windows usa para arquivos de spool
+            # Padrao A: FP + 5 digitos (ex: FP00175.SHD) - usado neste servidor
+            # Padrao B: 8 digitos sem prefixo (ex: 00000175.SHD) - padrao classico
+            $bases = @(
+                Join-Path $Config.SpoolDir ("FP{0:D5}" -f $job.Id),
+                Join-Path $Config.SpoolDir ("{0:D8}" -f $job.Id)
+            )
 
-            if ((Test-Path $shdDireto) -or (Test-Path $splDireto)) {
-                if (Test-Path $shdDireto) { Remove-Item $shdDireto -Force -ErrorAction SilentlyContinue }
-                if (Test-Path $splDireto) { Remove-Item $splDireto -Force -ErrorAction SilentlyContinue }
-                Write-Log ("  Fisico removido (ID direto): Job={0} | Doc='{1}' | Fila='{2}'" -f `
-                    $job.Id, $job.Documento, $job.Impressora)
-                $removidos++
-                $removeuEsteJob = $true
+            foreach ($base in $bases) {
+                $shdDireto = "$base.SHD"
+                $splDireto = "$base.SPL"
+                if ((Test-Path $shdDireto) -or (Test-Path $splDireto)) {
+                    if (Test-Path $shdDireto) { Remove-Item $shdDireto -Force -ErrorAction SilentlyContinue }
+                    if (Test-Path $splDireto) { Remove-Item $splDireto -Force -ErrorAction SilentlyContinue }
+                    Write-Log ("  Fisico removido (ID direto): Job={0} | Base='{1}' | Fila='{2}'" -f `
+                        $job.Id, [System.IO.Path]::GetFileName($base), $job.Impressora)
+                    $removidos++
+                    $removeuEsteJob = $true
+                    break
+                }
             }
 
             if (-not $removeuEsteJob) {
