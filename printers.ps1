@@ -331,10 +331,10 @@ if ($jobsExpirados.Count -gt 0) {
     $jobsTravados = @(Invoke-CancelarJobs -Jobs $jobsExpirados)
 
     # Passo 2: para os que a API nao conseguiu, remove fisicamente os arquivos de spool
+    # O Spooler so e reiniciado aqui, quando ha jobs realmente travados
     Invoke-RemocaoFisica -Jobs $jobsTravados
 } else {
-    # Sem jobs expirados: apenas reinicia o Spooler preventivamente
-    Invoke-RestartSpooler
+    Write-Log "Nenhum job expirado. Spooler mantido sem interrupcao."
 }
 
 Write-Log "Ciclo concluido."
